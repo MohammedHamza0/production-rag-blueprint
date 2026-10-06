@@ -1,0 +1,153 @@
+# ==============================================================================
+# Production RAG Blueprint - Enterprise Multi-Container Orchestration
+# Services: PostgreSQL 16 (pgvector), Redis 7.4, FastAPI API, Taskiq Worker, Nginx
+# ==============================================================================
+
+name: production-rag-blueprint
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. PostgreSQL 16 + pgvector Persistence
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: rag_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rag_blueprint_db}
+      POSTGRES_USER: ${POSTGRES_USER:-rag_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag_secure_password_2026}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag_user} -d ${POSTGRES_DB:-rag_blueprint_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - rag_network
+
+  # ----------------------------------------------------------------------------
+  # 2. Redis 7.4 Distributed Cache, Mutex & Broker
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:7.4-alpine
+    container_name: rag_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "volatile-lru"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - rag_network
+
+  # ----------------------------------------------------------------------------
+  # 3. FastAPI Core Application Server
+  # ----------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: rag_api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-rag_user}:${POSTGRES_PASSWORD:-rag_secure_password_2026}@postgres:5432/${POSTGRES_DB:-rag_blueprint_db}
+      REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DEFAULT_CHAT_MODEL: ${DEFAULT_CHAT_MODEL:-gemini-3.5-flash-lite}
+      DEFAULT_FALLBACK_MODEL: ${DEFAULT_FALLBACK_MODEL:-gemini-1.5-flash}
+      DEFAULT_EMBEDDING_MODEL: ${DEFAULT_EMBEDDING_MODEL:-gemini-embedding-2}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
+      RATE_LIMIT_USER_RPM: ${RATE_LIMIT_USER_RPM:-120}
+      RATE_LIMIT_GUEST_RPM: ${RATE_LIMIT_GUEST_RPM:-15}
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - rag_network
+
+  # ----------------------------------------------------------------------------
+  # 4. Taskiq Background Async Ingestion Worker
+  # ----------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: rag_worker
+    restart: unless-stopped
+    command: ["taskiq", "worker", "src.workers.broker:broker", "src.workers.tasks"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-rag_user}:${POSTGRES_PASSWORD:-rag_secure_password_2026}@postgres:5432/${POSTGRES_DB:-rag_blueprint_db}
+      REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DEFAULT_CHAT_MODEL: ${DEFAULT_CHAT_MODEL:-gemini-3.5-flash-lite}
+      DEFAULT_FALLBACK_MODEL: ${DEFAULT_FALLBACK_MODEL:-gemini-1.5-flash}
+      DEFAULT_EMBEDDING_MODEL: ${DEFAULT_EMBEDDING_MODEL:-gemini-embedding-2}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    networks:
+      - rag_network
+
+  # ----------------------------------------------------------------------------
+  # 5. Nginx Production Reverse Proxy (SSE Unbuffered)
+  # ----------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: rag_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - rag_network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  rag_network:
+    driver: bridge

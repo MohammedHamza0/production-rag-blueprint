@@ -1,0 +1,92 @@
+name: CI/CD Pipeline - Production RAG Blueprint
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-and-tests:
+    name: Code Quality & Automated Test Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: rag_blueprint_db
+          POSTGRES_USER: rag_user
+          POSTGRES_PASSWORD: rag_secure_password_2026
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rag_user -d rag_blueprint_db"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install .[dev]
+
+      - name: Static Code Analysis (Ruff)
+        run: |
+          ruff check src/ tests/
+
+      - name: Execute Automated Test Suite (Unit & Integration)
+        env:
+          DATABASE_URL: postgresql+asyncpg://rag_user:rag_secure_password_2026@localhost:5432/rag_blueprint_db
+          REDIS_URL: redis://localhost:6379/0
+          ENVIRONMENT: testing
+          LOG_LEVEL: INFO
+        run: |
+          pytest -v --durations=10
+
+  docker-verification:
+    name: Docker Image Build & Validation
+    runs-on: ubuntu-latest
+    needs: quality-and-tests
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: actions/setup-buildx-action@v3
+
+      - name: Build Application Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime
+          push: false
+          tags: production-rag-blueprint:ci
